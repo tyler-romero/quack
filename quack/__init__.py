@@ -5,6 +5,7 @@ import os
 from quack.rmsnorm import rmsnorm
 from quack.softmax import softmax
 from quack.cross_entropy import cross_entropy
+from quack.cross_entropy_chunked import cross_entropy_chunked
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -18,4 +19,5 @@ __all__ = [
     "rmsnorm",
     "softmax",
     "cross_entropy",
+    "cross_entropy_chunked",
 ]
