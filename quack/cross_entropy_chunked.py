@@ -1,7 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from functools import partial
 from typing import Optional, Type, Literal
 
 import torch
@@ -15,7 +14,6 @@ from cutlass import Int32, Int64, Float32, Boolean, const_expr
 
 import quack.utils as utils
 import quack.copy_utils as copy_utils
-import quack.layout_utils as layout_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
@@ -34,7 +32,8 @@ class CrossEntropyChunkedFwd(ReductionBase):
         self.full_N = N
         self.chunk_N = chunk_N
         self.num_chunks = math.ceil(N / chunk_N)
-        super().__init__(dtype, chunk_N, stage=1, reduction_dtype=Float32)
+        # 2 stages: slot 0 for max reduction, slot 1 for sum reduction
+        super().__init__(dtype, chunk_N, stage=2, reduction_dtype=Float32)
 
     def _threads_per_row(self):
         N = self.chunk_N
@@ -109,11 +108,13 @@ class CrossEntropyChunkedFwd(ReductionBase):
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        # Get row index from the first chunk's coordinate tile
+        # Get row index and pre-allocate fragments using first chunk
         gX_0 = cute.local_tile(mX, tiler_mn, (bidx, 0))
         cX_0 = cute.local_tile(idX, tiler_mn, (bidx, 0))
+        tXgX_0 = thr_copy.partition_S(gX_0)
         tXcX_0 = thr_copy.partition_S(cX_0)[(0, None), None, None]
         row = tXcX_0[0][0]
+        tXrX = cute.make_fragment_like(tXgX_0)
 
         target = Int32.zero
         should_ignore = Boolean(True)
@@ -121,7 +122,6 @@ class CrossEntropyChunkedFwd(ReductionBase):
             target = Int32(mTarget[row])
             should_ignore = Boolean(target == ignore_index)
 
-        # Load target logit
         target_logit = Float32.zero
         if row < shape[0] and tXcX_0[0][1] == 0 and not should_ignore:
             target_logit = Float32(mX[row, target])
@@ -131,29 +131,29 @@ class CrossEntropyChunkedFwd(ReductionBase):
         sum_exp = Float32.zero
         num_chunks = const_expr(self.num_chunks)
         is_even_N = const_expr(self.full_N % self.chunk_N == 0)
+        log2_e = math.log2(math.e)
 
         for chunk_idx in cutlass.range(num_chunks, unroll_full=const_expr(num_chunks <= 4)):
             gX_chunk = cute.local_tile(mX, tiler_mn, (bidx, chunk_idx))
-            cX_chunk = cute.local_tile(idX, tiler_mn, (bidx, chunk_idx))
             tXgX_chunk = thr_copy.partition_S(gX_chunk)
-            tXrX_chunk = cute.make_fragment_like(tXgX_chunk)
 
             if const_expr(not is_even_N):
+                cX_chunk = cute.local_tile(idX, tiler_mn, (bidx, chunk_idx))
                 tXpX_chunk = copy_utils.predicate_k(
                     thr_copy.partition_S(cX_chunk), limit=shape[1]
                 )
-                copy_chunk = partial(copy_utils.copy, pred=tXpX_chunk)
-            else:
-                copy_chunk = copy_utils.copy
 
             if row < shape[0]:
-                copy_chunk(tXgX_chunk, tXsX, is_async=True)
+                if const_expr(not is_even_N):
+                    copy_utils.copy(tXgX_chunk, tXsX, pred=tXpX_chunk, is_async=True)
+                else:
+                    copy_utils.copy(tXgX_chunk, tXsX, is_async=True)
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             if const_expr(not is_even_N):
                 utils.fill_oob(tXsX, tXpX_chunk, -tXsX.element_type.inf)
-            cute.autovec_copy(tXsX, tXrX_chunk)
-            x = tXrX_chunk.load().to(Float32)
+            cute.autovec_copy(tXsX, tXrX)
+            x = tXrX.load().to(Float32)
 
             chunk_max = row_reduce(
                 x,
@@ -163,18 +163,16 @@ class CrossEntropyChunkedFwd(ReductionBase):
                 None,
                 init_val=-Float32.inf,
             )
-            log2_e = math.log2(math.e)
             exp_x = cute.math.exp2(x * log2_e - (chunk_max * log2_e), fastmath=False)
             chunk_sum_exp = row_reduce(
                 exp_x,
                 cute.ReductionOp.ADD,
                 threads_per_row,
-                reduction_buffer[None, None, 0],
+                reduction_buffer[None, None, 1],
                 None,
                 init_val=0.0,
             )
 
-            # Online softmax accumulation across chunks
             new_max = cute.arch.fmax(max_val, chunk_max)
             sum_exp = (
                 sum_exp * cute.math.exp(max_val - new_max, fastmath=True)
@@ -184,16 +182,15 @@ class CrossEntropyChunkedFwd(ReductionBase):
 
         # Compute loss and lse
         lse = max_val + cute.math.log(sum_exp, fastmath=True)
-        if (
-            tXcX_0[0][1] == 0
-            and row < shape[0]
-        ):
+        if tXcX_0[0][1] == 0 and row < shape[0]:
             loss_val = (lse - target_logit) if not should_ignore else Float32.zero
             mLoss[row] = mLoss.element_type(loss_val)
             if const_expr(mLSE is not None):
                 mLSE[row] = lse
 
-        # ---- Pass 2: Compute gradients using final lse ----
+        # ---- Pass 2: Compute gradients using final statistics ----
+        cute.arch.barrier()
+
         denom_inv = (
             cute.arch.rcp_approx(sum_exp)
             if not (sum_exp == 0.0 or sum_exp != sum_exp or should_ignore)
@@ -206,40 +203,41 @@ class CrossEntropyChunkedFwd(ReductionBase):
             cX_chunk = cute.local_tile(idX, tiler_mn, (bidx, chunk_idx))
             tXgX_chunk = thr_copy.partition_S(gX_chunk)
             tXgdX_chunk = thr_copy.partition_D(gdX_chunk)
-            tXrX_chunk = cute.make_fragment_like(tXgX_chunk)
-            tXrdX_chunk = cute.make_fragment_like(tXgdX_chunk)
+            tXrdX = cute.make_fragment_like(tXgdX_chunk)
             tXcFull_chunk = thr_copy.partition_S(cX_chunk)
 
             if const_expr(not is_even_N):
                 tXpX_chunk = copy_utils.predicate_k(
                     thr_copy.partition_S(cX_chunk), limit=shape[1]
                 )
-                copy_chunk = partial(copy_utils.copy, pred=tXpX_chunk)
-            else:
-                copy_chunk = copy_utils.copy
 
             if row < shape[0]:
-                copy_chunk(tXgX_chunk, tXsX, is_async=True)
+                if const_expr(not is_even_N):
+                    copy_utils.copy(tXgX_chunk, tXsX, pred=tXpX_chunk, is_async=True)
+                else:
+                    copy_utils.copy(tXgX_chunk, tXsX, is_async=True)
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             if const_expr(not is_even_N):
                 utils.fill_oob(tXsX, tXpX_chunk, -tXsX.element_type.inf)
-            cute.autovec_copy(tXsX, tXrX_chunk)
-            x = tXrX_chunk.load().to(Float32)
+            cute.autovec_copy(tXsX, tXrX)
+            x = tXrX.load().to(Float32)
 
-            log2_e = math.log2(math.e)
             probs = cute.math.exp2(x * log2_e - (max_val * log2_e), fastmath=True) * denom_inv
 
-            tXrdX_f32 = cute.make_fragment_like(tXrX_chunk, Float32)
+            tXrdX_f32 = cute.make_fragment_like(tXrX, Float32)
             tXrdX_f32.store(probs)
             if not should_ignore:
-                for i in cutlass.range(cute.size(tXrX_chunk), unroll_full=True):
+                for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                     tXrdX_f32[i] = (
                         tXrdX_f32[i] if tXcFull_chunk[i][1] != target else tXrdX_f32[i] - 1.0
                     )
-            tXrdX_chunk.store(tXrdX_f32.load().to(tXrdX_chunk.element_type))
+            tXrdX.store(tXrdX_f32.load().to(tXrdX.element_type))
             if row < shape[0]:
-                copy_chunk(tXrdX_chunk, tXgdX_chunk)
+                if const_expr(not is_even_N):
+                    copy_utils.copy(tXrdX, tXgdX_chunk, pred=tXpX_chunk)
+                else:
+                    copy_utils.copy(tXrdX, tXgdX_chunk)
 
 
 def _default_chunk_n(N: int) -> int:
@@ -335,7 +333,6 @@ class CrossEntropyChunkedFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dloss):
         dx, lse = ctx.saved_tensors
-        # dx already contains (softmax - one_hot), just scale by dloss
         dx = dx * dloss.unsqueeze(1)
         return dx, None, None, None, None
 
