@@ -46,7 +46,8 @@ def chunked_linear_cross_entropy_fwd(
     chunk_size: int = 4096,
     ignore_index: int = -100,
     tuned: bool = True,
-) -> tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+    z_loss_weight: float = 0.0,
+) -> tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     """
     Chunked forward pass for linear cross entropy.
 
@@ -54,11 +55,12 @@ def chunked_linear_cross_entropy_fwd(
     for each chunk, stores dx for each chunk, and accumulates dw.
 
     Returns:
-        loss: (B*L,) loss values
+        loss: (B*L,) loss values (includes z-loss contribution when z_loss_weight > 0)
         dx: (B*L, d) gradient w.r.t. input
         dw: (V, d) gradient w.r.t. weight (accumulated across chunks except last)
         last_dlogits_chunk: (chunk_len, V) gradient of last chunk's logits (for deferred dw computation)
         last_x_chunk: (chunk_len, d) last chunk's input (for deferred dw computation)
+        z_loss_sum: scalar sum of lse^2 over valid tokens (None when z_loss_weight == 0)
     """
     B_L, d = x.shape
     V, _ = weight.shape
@@ -67,10 +69,12 @@ def chunked_linear_cross_entropy_fwd(
     # Since we use gemm with TMA we require some alignment
     assert chunk_size % 8 == 0, "chunk_size must be multiple of 8"
     assert B_L % 8 == 0
+    has_z_loss = z_loss_weight > 0.0
     # Pre-allocate outputs
     loss = torch.empty(B_L, device=device, dtype=torch.float32)
     logits_chunk_preallocated = torch.empty((chunk_size, V), device=device, dtype=x.dtype)
     dx = torch.empty_like(x)
+    lse = torch.empty(B_L, device=device, dtype=torch.float32) if has_z_loss else None
     # Last chunk of dw will be deferred to the backward pass
     dw = torch.empty_like(weight, dtype=torch.float32) if num_chunks > 1 else None
     last_dlogits_chunk = None
@@ -81,6 +85,8 @@ def chunked_linear_cross_entropy_fwd(
         zip(*(t.split(chunk_size) for t in (x, target, loss, dx)))
     ):
         chunk_len = x_chunk.shape[0]
+        chunk_start = i * chunk_size
+        lse_chunk = lse[chunk_start : chunk_start + chunk_len] if has_z_loss else None
         logits_chunk = logits_chunk_preallocated[:chunk_len]  # (chunk_len, V)
         torch.mm(x_chunk, weight.mT, out=logits_chunk)
         # Compute cross entropy forward with gradients
@@ -90,10 +96,23 @@ def chunked_linear_cross_entropy_fwd(
             target_chunk,
             None,  # target_logit
             loss=loss_chunk,
-            lse=None,  # we don't need lse here
+            lse=lse_chunk,
             dx=dlogits_chunk,
             ignore_index=ignore_index,
         )
+        # Fix up dlogits for z-loss: add 2 * z_loss_weight * lse * softmax(logits) contribution
+        # dlogits currently = probs - one_hot(target)
+        # desired = (1 + 2*z*lse) * probs - one_hot(target)
+        # so: scale by (1 + 2*z*lse), then add 2*z*lse at target positions
+        if has_z_loss:
+            z_scale = (2.0 * z_loss_weight * lse_chunk).to(dlogits_chunk.dtype).unsqueeze(1)
+            dlogits_chunk *= 1.0 + z_scale
+            # Scatter-add 2*z*lse at target positions for valid (non-ignored) tokens.
+            # For ignored tokens, dlogits are already zero so the mul above is a no-op,
+            # and we mask z_scale to avoid writing to arbitrary positions.
+            valid = target_chunk != ignore_index
+            z_scale_masked = torch.where(valid.unsqueeze(1), z_scale, 0.0)
+            dlogits_chunk.scatter_add_(1, target_chunk.clamp(min=0).unsqueeze(1), z_scale_masked)
         # Compute dx for this chunk: dlogits @ weight
         torch.mm(dlogits_chunk, weight, out=dx_chunk)  # (chunk_len, d)
         # Compute dw for all chunks except the last
@@ -107,7 +126,16 @@ def chunked_linear_cross_entropy_fwd(
         else:
             # Middle chunks: dw += dlogits.T @ x_chunk
             gemm_add_inplace(dlogits_chunk.T, x_chunk, dw, tuned=tuned)
-    return loss, dx, dw, last_dlogits_chunk, last_x_chunk
+
+    # Compute z-loss and add to per-token loss
+    z_loss_sum = None
+    if has_z_loss:
+        valid = target != ignore_index
+        lse_sq = torch.where(valid, lse.square(), 0.0)
+        z_loss_sum = z_loss_weight * lse_sq.sum()
+        loss += z_loss_weight * lse_sq
+
+    return loss, dx, dw, last_dlogits_chunk, last_x_chunk, z_loss_sum
 
 
 class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
@@ -122,6 +150,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         reduction: Literal["mean", "sum"] = "mean",
         chunk_size: int = 4096,
         tuned: bool = True,
+        z_loss_weight: float = 0.0,
     ):
         """
         Forward pass computes loss and stores dx and dw for backward.
@@ -131,8 +160,16 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         batch_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
         # TODO: don't need to compute bwd if neither x nor weight requires grad, or not training
-        loss, dx, dw, last_dlogits_chunk, last_x_chunk = chunked_linear_cross_entropy_fwd(
-            x, weight, target, chunk_size, ignore_index, tuned=tuned
+        loss, dx, dw, last_dlogits_chunk, last_x_chunk, z_loss_sum = (
+            chunked_linear_cross_entropy_fwd(
+                x,
+                weight,
+                target,
+                chunk_size,
+                ignore_index,
+                tuned=tuned,
+                z_loss_weight=z_loss_weight,
+            )
         )
         loss_sum = loss.sum()
         loss_scale = None if reduction == "sum" else 1.0 / (target != ignore_index).sum().float()
@@ -141,15 +178,21 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.reduction = reduction
         ctx.tuned = tuned
-        return loss_sum if loss_scale is None else loss_sum * loss_scale
+        total_loss = loss_sum if loss_scale is None else loss_sum * loss_scale
+        # z_loss for logging (detached, does not affect backward)
+        if z_loss_sum is not None:
+            z_loss_out = z_loss_sum if loss_scale is None else z_loss_sum * loss_scale
+        else:
+            z_loss_out = total_loss.new_zeros(())
+        return total_loss, z_loss_out
 
     @staticmethod
     @custom_bwd(device_type="cuda")
-    def backward(ctx, dloss):
+    def backward(ctx, dloss, _dz_loss):
         """
         Backward pass scales pre-computed gradients by dloss and completes
         the last chunk's dw computation.
-        dloss is a scalar.
+        dloss is a scalar. _dz_loss is ignored (z_loss output is for logging only).
         """
         dx, dw, last_dlogits_chunk, last_x_chunk, loss_scale = ctx.saved_tensors
         tuned = ctx.tuned
@@ -186,7 +229,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
                     out_dtype=ctx.weight_dtype,
                     tuned=tuned,
                 )
-        return dx, dw, None, None, None, None, None
+        return dx, dw, None, None, None, None, None, None
 
 
 def chunked_linear_cross_entropy(
@@ -197,7 +240,9 @@ def chunked_linear_cross_entropy(
     ignore_index: int = -100,
     reduction: Literal["mean", "sum"] = "mean",
     tuned: bool = True,
-) -> Tensor:
+    z_loss_weight: float = 0.0,
+    return_z_loss: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
     """
     Chunked linear cross entropy with automatic differentiation support.
 
@@ -209,15 +254,19 @@ def chunked_linear_cross_entropy(
         ignore_index: Index to ignore in loss computation
         reduction: Type of reduction to apply
         tuned: Whether to use tuned kernels
+        z_loss_weight: Weight for z-loss (lse^2 penalty). 0 disables z-loss.
+        return_z_loss: If True, return (loss, z_loss) tuple where z_loss is detached.
 
     Returns:
-        Loss tensor with specified reduction
+        Loss tensor (includes z-loss when z_loss_weight > 0), or (loss, z_loss) tuple.
     """
     if reduction not in ["mean", "sum"]:
         raise ValueError(f"Invalid reduction: {reduction}")
-    loss = ChunkedLinearCrossEntropyFunction.apply(
-        x, weight, target, ignore_index, reduction, chunk_size, tuned
+    loss, z_loss = ChunkedLinearCrossEntropyFunction.apply(
+        x, weight, target, ignore_index, reduction, chunk_size, tuned, z_loss_weight
     )
+    if return_z_loss:
+        return loss, z_loss
     return loss
 
 
@@ -232,6 +281,8 @@ class LinearCrossEntropy(nn.Linear):
         chunk_size: Optional[int] = None,
         inplace_backward: bool = False,
         tuned: bool = True,
+        z_loss_weight: float = 0.0,
+        return_z_loss: bool = False,
         device=None,
         dtype=None,
     ) -> None:
@@ -241,8 +292,10 @@ class LinearCrossEntropy(nn.Linear):
         self.chunk_size = chunk_size
         self.inplace_backward = inplace_backward
         self.tuned = tuned
+        self.z_loss_weight = z_loss_weight
+        self.return_z_loss = return_z_loss
 
-    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+    def forward(self, input: Tensor, target: Tensor) -> Tensor | tuple[Tensor, Tensor]:
         if (
             self.bias is None
             and input.is_cuda
@@ -262,6 +315,8 @@ class LinearCrossEntropy(nn.Linear):
                 ignore_index=self.ignore_index,
                 reduction=self.reduction,
                 tuned=self.tuned,
+                z_loss_weight=self.z_loss_weight,
+                return_z_loss=self.return_z_loss,
             )
         else:
             return linear_cross_entropy_func(
