@@ -107,10 +107,12 @@ def chunked_linear_cross_entropy_fwd(
         if has_z_loss:
             z_scale = (2.0 * z_loss_weight * lse_chunk).to(dlogits_chunk.dtype).unsqueeze(1)
             dlogits_chunk *= 1.0 + z_scale
+            # Scatter-add 2*z*lse at target positions for valid (non-ignored) tokens.
+            # For ignored tokens, dlogits are already zero so the mul above is a no-op,
+            # and we mask z_scale to avoid writing to arbitrary positions.
             valid = target_chunk != ignore_index
-            valid_idx = valid.nonzero(as_tuple=True)[0]
-            if valid_idx.numel() > 0:
-                dlogits_chunk[valid_idx, target_chunk[valid_idx]] += z_scale[valid_idx, 0]
+            z_scale_masked = torch.where(valid.unsqueeze(1), z_scale, 0.0)
+            dlogits_chunk.scatter_add_(1, target_chunk.clamp(min=0).unsqueeze(1), z_scale_masked)
         # Compute dx for this chunk: dlogits @ weight
         torch.mm(dlogits_chunk, weight, out=dx_chunk)  # (chunk_len, d)
         # Compute dw for all chunks except the last
@@ -129,8 +131,7 @@ def chunked_linear_cross_entropy_fwd(
     z_loss_sum = None
     if has_z_loss:
         valid = target != ignore_index
-        lse_sq = lse.square()
-        lse_sq[~valid] = 0.0
+        lse_sq = torch.where(valid, lse.square(), 0.0)
         z_loss_sum = z_loss_weight * lse_sq.sum()
         loss += z_loss_weight * lse_sq
 
